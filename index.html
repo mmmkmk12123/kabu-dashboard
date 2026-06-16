@@ -53,7 +53,7 @@
   <div class="panel"><h2>累積損益の推移</h2><canvas id="chart" height="180"></canvas></div>
 
   <div class="panel"><h2>取引明細（最新30件）</h2>
-    <table id="tbl"><thead><tr><th>日付/時刻</th><th>銘柄</th><th>買値→売値</th><th>損益</th></tr></thead>
+    <table id="tbl"><thead><tr><th>日付</th><th>銘柄</th><th>買→売 時刻</th><th>買値→売値</th><th>損益</th></tr></thead>
     <tbody id="rows"></tbody></table>
     <div class="empty" id="empty" style="display:none">まだ取引がありません</div>
   </div>
@@ -76,8 +76,8 @@ async function load(){
   const lines = text.trim().split('\n');
   const header = lines.shift();
   const rows = lines.filter(l=>l.trim()).map(l=>{
-    const [date,time,symbol,qty,entry,exit,pnl,reason,dry] = l.split(',');
-    return {date,time,symbol,qty,entry,exit,pnl:+pnl,reason};
+    const [date,buy_time,sell_time,symbol,qty,entry,exit,pnl,reason,dry] = l.split(',');
+    return {date,buy_time,sell_time,symbol,qty,entry,exit,pnl:+pnl,reason};
   });
   document.getElementById('updated').textContent = new Date().toLocaleString('ja-JP');
 
@@ -106,11 +106,13 @@ async function load(){
 
   // 明細(最新30)
   const tb=document.getElementById('rows'); tb.innerHTML='';
+  const hm = t => t ? t.slice(11,16) : '—';
   rows.slice(-30).reverse().forEach(r=>{
     const tr=document.createElement('tr');
-    tr.innerHTML = `<td>${r.date.slice(5)} ${r.time.slice(11,16)}</td>
+    tr.innerHTML = `<td>${r.date.slice(5)}</td>
       <td>${r.symbol}</td>
-      <td>${(+r.entry).toFixed(0)}→${(+r.exit).toFixed(0)}<div class="reason">${r.reason}</div></td>
+      <td>${hm(r.buy_time)}→${hm(r.sell_time)}</td>
+      <td>${(+r.entry).toFixed(2)}→${(+r.exit).toFixed(2)}<div class="reason">${r.reason}</div></td>
       <td class="${cls(r.pnl)}">${yen(r.pnl)}</td>`;
     tb.appendChild(tr);
   });
