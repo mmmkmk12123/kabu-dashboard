@@ -15,6 +15,7 @@
     --s1:        #2a78d6;  /* series1: コストなし (blue) */
     --s2:        #1baf7a;  /* series2: コスト込み (aqua) */
     --good:      #006300;  --bad:      #d03b3b;
+    --warn-bg:   rgba(208,59,59,0.08);   /* データソース警告の薄い塗り（--bad と同色相） */
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -25,6 +26,7 @@
       --border:    rgba(255,255,255,0.10);
       --s1:        #3987e5;  --s2:       #199e70;
       --good:      #0ca30c;  --bad:      #d03b3b;
+      --warn-bg:   rgba(208,59,59,0.14);
     }
   }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
@@ -59,6 +61,23 @@
   tr:last-child td { border-bottom: none; }
   th { color: var(--muted); font-weight: 500; font-size: 11px; }
   .reason { color: var(--muted); font-size: 11px; }
+  /* データソース表示（api=リアルタイム以外は警告色で目立たせる） */
+  .srcbar { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 10px;
+            background: var(--surface); border: 1px solid var(--border);
+            border-radius: 12px; padding: 10px 14px; margin-bottom: 16px; }
+  .srcbar .label { color: var(--muted); font-size: 11px; }
+  .srcbar .val { font-size: 14px; font-weight: 650; }
+  .srcbar .hint { color: var(--muted); font-size: 11px; }
+  .srcbar.warn { border-color: var(--bad); background: var(--warn-bg); }
+  .srcbar.warn .val, .srcbar.warn .hint { color: var(--bad); }
+  .srcbar .val.ok { color: var(--good); }   /* 警告でないときだけ緑（警告時は上の規則が勝つ） */
+  .src { font-size: 10px; line-height: 1.5; white-space: nowrap; color: var(--muted); }
+  .src.warn { color: var(--bad); font-weight: 650; }
+  .src-mini { display: none; }
+  @media (max-width: 560px) {   /* スマホ幅では表内のバッジを短縮表記にする */
+    .src-full { display: none; }
+    .src-mini { display: inline; }
+  }
   .empty { color: var(--muted); text-align: center; padding: 22px; font-size: 13px; }
   canvas { max-width: 100%; }
 </style>
@@ -77,6 +96,12 @@
     <span class="chip">スコア75↑ × 出来高4倍↑</span>
     <span class="chip">〜11:30エントリー</span>
     <span class="chip">トレール2.5% / 損切0.8%</span>
+  </div>
+
+  <div class="srcbar" id="srcBar">
+    <span class="label">直近のデータソース</span>
+    <span class="val" id="srcBarVal">—</span>
+    <span class="hint" id="srcBarHint"></span>
   </div>
 
   <div class="tiles">
@@ -130,6 +155,93 @@ const yen = n => (n>=0?'+':'') + Math.round(n).toLocaleString() + '円';
 const cls = n => n>=0?'pos':'neg';
 const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
 
+// データソースの表示名。取引システム側 kabu_trader/live/journal.py の SOURCE_LABELS と揃える
+const SRC_LABELS = {
+  api:      'API(リアルタイム)',
+  yfinance: 'yfinance(約20分遅延)',
+  backfill: 'backfill(引け後の補完)',
+  aborted:  '稼働なし(API未接続のため中止)',
+  unknown:  '不明(記録なし)',
+};
+const SRC_SHORT = {   // スマホ幅用の短縮表記
+  api: 'API', yfinance: 'yfinance', backfill: 'backfill',
+  aborted: '稼働なし', unknown: '不明',
+};
+const esc = s => String(s).replace(/[&<>"]/g,
+  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+// source は無い（記録が古い・列が未追加）場合があるため、必ず unknown に丸める
+const srcKey = s => (s && String(s).trim()) ? String(s).trim() : 'unknown';
+const srcFull = s => SRC_LABELS[srcKey(s)] || srcKey(s);   // 未知の値はそのまま出す
+const srcShort = s => SRC_SHORT[srcKey(s)] || srcKey(s);
+// 警告レベル。unknown は「source列を追加する前の記録＝記録なし」であって
+// 「APIで動いていない」ではないため、警告にはせず中立色で出す（アラート疲れの防止）。
+// 表に無い値（yfinance / aborted / 未知の値）だけが warn になる。
+const SRC_LEVEL = { api: 'ok', backfill: 'info', unknown: 'info' };
+const srcLevel = s => SRC_LEVEL[srcKey(s)] || 'warn';
+function srcBadge(s){   // 表の行に添える小さなデータソース表示
+  const w = srcLevel(s) === 'warn';
+  return `<div class="src${w?' warn':''}" title="データ: ${esc(srcFull(s))}">${w?'⚠️ ':''}`
+    + `<span class="src-full">${esc(srcFull(s))}</span>`
+    + `<span class="src-mini">${esc(srcShort(s))}</span></div>`;
+}
+
+// ---- 営業日の判定（days.json の更新が止まっていないかの確認に使う） ----
+// 東証の休場日 = 土日 / 国民の祝日 / 年末年始(12/31-1/3)。
+// 取引システム側は jpholiday を使うが、ここは外部ライブラリを足せないので表を持つ。
+// **この表は年に一度、追記が必要**（範囲外の年は下の HOLIDAY_YEARS 判定で猶予を広げる）。
+const JP_HOLIDAYS = new Set([
+  '2026-01-01','2026-01-12','2026-02-11','2026-02-23','2026-03-20','2026-04-29',
+  '2026-05-03','2026-05-04','2026-05-05','2026-05-06','2026-07-20','2026-08-11',
+  '2026-09-21','2026-09-22','2026-09-23','2026-10-12','2026-11-03','2026-11-23',
+  '2027-01-01','2027-01-11','2027-02-11','2027-02-23','2027-03-21','2027-03-22',
+  '2027-04-29','2027-05-03','2027-05-04','2027-05-05','2027-07-19','2027-08-11',
+  '2027-09-20','2027-09-23','2027-10-11','2027-11-03','2027-11-23',
+]);
+const HOLIDAY_YEARS = new Set([2026, 2027]);   // 上の表が網羅している年
+const ymd = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`
+  + `-${String(d.getDate()).padStart(2,'0')}`;
+const parseYmd = s => new Date(+s.slice(0,4), +s.slice(5,7)-1, +s.slice(8,10));
+function isTradingDay(d){
+  const w = d.getDay();
+  if(w===0 || w===6) return false;                       // 土日
+  if(JP_HOLIDAYS.has(ymd(d))) return false;              // 祝日
+  const m = d.getMonth()+1, day = d.getDate();
+  if((m===12 && day===31) || (m===1 && day<=3)) return false;   // 年末年始
+  return true;
+}
+function prevTradingDay(d){
+  const x = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  for(let i=0;i<30;i++){ x.setDate(x.getDate()-1); if(isTradingDay(x)) break; }
+  return x;
+}
+// days.json は毎営業日16:00の日次サマリーでしか更新されない。
+// よって「本日分が載っているべき時刻」を過ぎるまでは前営業日が最新で正常。
+function expectedLatestDate(now){
+  let d = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  if(!isTradingDay(d)) return ymd(prevTradingDay(d));
+  const mins = now.getHours()*60 + now.getMinutes();
+  return ymd(mins >= 16*60+30 ? d : prevTradingDay(d));   // 16:30まではまだ書かれていない
+}
+function tradingDaysBetween(fromYmd, toYmd){   // from(含まない)〜to(含む) の営業日数
+  const to = parseYmd(toYmd), x = parseYmd(fromYmd);
+  let n = 0;
+  for(let i=0;i<400;i++){
+    x.setDate(x.getDate()+1);
+    if(x > to) break;
+    if(isTradingDay(x)) n++;
+  }
+  return n;
+}
+// 記録が何営業日分止まっているか。0なら正常。
+function staleDays(latestYmd, now){
+  const exp = expectedLatestDate(now);
+  if(!latestYmd || latestYmd >= exp) return 0;
+  const n = tradingDaysBetween(latestYmd, exp);
+  // 祝日表に無い年は、祝日を営業日と誤判定して誤警告が出るため1営業日ぶん猶予する
+  const tol = HOLIDAY_YEARS.has(parseYmd(exp).getFullYear()) ? 1 : 2;
+  return n >= tol ? n : 0;
+}
+
 function costOf(r){ // 半ティック×往復（買い成行＋売り成行）。利確指値のみ売り側0
   const q=+r.qty, e=+r.entry, x=+r.exit;
   let c = tick(e)*0.5*q;
@@ -144,8 +256,10 @@ async function load(){
   const text = await res.text();
   const lines = text.trim().split('\n'); lines.shift();
   const rows = lines.filter(l=>l.trim()).map(l=>{
-    const [date,buy_time,sell_time,symbol,qty,entry,exit,pnl,reason] = l.split(',');
-    return {date,buy_time,sell_time,symbol,qty,entry,exit,pnl:+pnl,reason};
+    // 11列目 source は後から追加された列。10列のままのCSVでも壊れないよう undefined を許容する
+    const [date,buy_time,sell_time,symbol,qty,entry,exit,pnl,reason,dry_run,source] = l.split(',');
+    return {date,buy_time,sell_time,symbol,qty,entry,exit,pnl:+pnl,reason,
+            source: srcKey(source)};
   }).filter(r => r.date >= V2_START);      // ★v2のみ表示
   document.getElementById('updated').textContent = new Date().toLocaleString('ja-JP');
 
@@ -166,8 +280,9 @@ async function load(){
   const wins = rows.filter(r=>r.pnl-costOf(r)>0).length;
 
   const byDay={};
-  rows.forEach(r=>{ byDay[r.date]=byDay[r.date]||{no:0,cost:0,n:0};
-    byDay[r.date].no+=r.pnl; byDay[r.date].cost+=r.pnl-costOf(r); byDay[r.date].n++; });
+  rows.forEach(r=>{ byDay[r.date]=byDay[r.date]||{no:0,cost:0,n:0,src:new Set()};
+    byDay[r.date].no+=r.pnl; byDay[r.date].cost+=r.pnl-costOf(r); byDay[r.date].n++;
+    byDay[r.date].src.add(r.source); });
   const days=Object.keys(byDay).sort();
 
   const byMonth={};   // 年月キー(YYYY-MM)で集計
@@ -194,13 +309,13 @@ async function load(){
                     months.map(m=>byMonth[m]?byMonth[m].cost:0));
 
   const tb=document.getElementById('rows'); tb.innerHTML='';
-  const hm = t => t && t.length>15 ? t.slice(11,16) : '—';
+  const hm = t => t && t.length>15 ? esc(t.slice(11,16)) : '—';
   rows.slice(-30).reverse().forEach(r=>{
     const net = r.pnl - costOf(r);
     const tr=document.createElement('tr');
-    tr.innerHTML = `<td>${r.date.slice(5)}</td><td>${r.symbol}</td>
+    tr.innerHTML = `<td>${r.date.slice(5)}${srcBadge(r.source)}</td><td>${esc(r.symbol)}</td>
       <td>${hm(r.buy_time)}→${hm(r.sell_time)}</td>
-      <td>${(+r.entry).toFixed(1)}→${(+r.exit).toFixed(1)}<div class="reason">${r.reason}</div></td>
+      <td>${(+r.entry).toFixed(1)}→${(+r.exit).toFixed(1)}<div class="reason">${esc(r.reason)}</div></td>
       <td class="${cls(net)}">${yen(net)}<div class="reason">なし ${yen(r.pnl)}</div></td>`;
     tb.appendChild(tr);
   });
@@ -220,6 +335,7 @@ async function renderDays(byDay){
     if(!days.some(x=>x.date===d)) days.push({date:d, status:'traded'});
   });
   days.sort((a,b)=>b.date.localeCompare(a.date));   // 新しい順
+  renderSrcBar(days, byDay);
   const tb = document.getElementById('daysRows'); tb.innerHTML='';
   if(!days.length){
     document.getElementById('daysEmpty').style.display='block';
@@ -230,22 +346,72 @@ async function renderDays(byDay){
   days.slice(0,15).forEach(d=>{
     const agg = byDay[d.date];
     const tr = document.createElement('tr');
-    if(d.status==='holiday'){
+    if(d.status==='holiday'){   // 休場日は稼働していないのでデータソースを出さない
       tr.innerHTML = `<td>${d.date.slice(5)}</td>
-        <td colspan="4" class="reason">休場 — ${d.note||'祝日'}</td>`;
-    } else if(!agg){
-      tr.innerHTML = `<td>${d.date.slice(5)}</td>
+        <td colspan="4" class="reason">休場 — ${esc(d.note||'祝日')}</td>`;
+      tb.appendChild(tr);
+      return;
+    }
+    const badge = srcBadge(daySrc(d, agg));
+    if(!agg){
+      tr.innerHTML = `<td>${d.date.slice(5)}${badge}</td>
         <td class="reason">取引なし</td><td>0</td>
         <td class="reason">—</td><td class="reason">—</td>`;
     } else {
       const nTrades = (typeof d.count==='number') ? d.count : agg.n || '';
-      tr.innerHTML = `<td>${d.date.slice(5)}</td><td>取引あり</td>
-        <td>${nTrades}</td>
+      tr.innerHTML = `<td>${d.date.slice(5)}${badge}</td><td>取引あり</td>
+        <td>${esc(nTrades)}</td>
         <td class="${cls(agg.no)}">${yen(agg.no)}</td>
         <td class="${cls(agg.cost)}">${yen(agg.cost)}</td>`;
     }
     tb.appendChild(tr);
   });
+}
+
+function daySrc(d, agg){
+  // days.json の source を優先。無い（古い記録）なら、その日の取引のsourceから拾う
+  if(d && d.source) return srcKey(d.source);
+  if(agg && agg.src && agg.src.size){
+    // 同じ日に複数のソースが混ざる場合は重い方を出す（遅延データの見逃し防止）。
+    // unknown は「記録なし」なので api より弱い扱いにする。
+    const rank = s => ({warn:3, info: srcKey(s)==='unknown' ? 0 : 2, ok:1})[srcLevel(s)];
+    return [...agg.src].sort((a,b)=>rank(b)-rank(a))[0];
+  }
+  return 'unknown';
+}
+
+const SRC_HINTS = {   // その日のデータソースが何を意味するか（すべて過去形＝時点の記録）
+  api:      'この日はリアルタイムAPIで稼働しました',
+  yfinance: 'リアルタイムAPIでは動いていません（約20分遅れのデータ）',
+  aborted:  'API未接続のため取引せず終了しました',
+  backfill: '引け後にまとめて補完した記録です',
+  unknown:  'データソースの記録がありません（確認してください）',
+};
+function renderSrcBar(days, byDay){
+  // 直近の稼働日（休場を除く最新日）の記録を画面上部に出す。
+  // days.json は16:00の日次サマリーでしか更新されないため、これは「現在の稼働状況」ではなく
+  // あくまで記録された時点の情報。現在形で書かず、日付を必ず添える。
+  const bar = document.getElementById('srcBar');
+  const valEl = document.getElementById('srcBarVal');
+  const latest = days.find(d=>d.status!=='holiday');
+  const s = latest ? daySrc(latest, byDay[latest.date]) : 'unknown';
+  const lv = latest ? srcLevel(s) : 'info';
+  const behind = latest ? staleDays(latest.date, new Date()) : 0;
+  const warn = behind > 0 || lv === 'warn';
+  bar.className = 'srcbar' + (warn ? ' warn' : '');
+  valEl.className = 'val' + (!warn && lv === 'ok' ? ' ok' : '');
+  if(behind > 0){
+    // 更新が止まっていること自体が検知したい異常（PC停止・自動実行の失敗）
+    valEl.textContent = `⚠️ 更新が止まっています（最終記録 ${latest.date}）`;
+    document.getElementById('srcBarHint').textContent =
+      `${behind}営業日分の記録がありません · `
+      + `その日のデータソース: ${srcFull(s)}`;
+    return;
+  }
+  valEl.textContent = (warn ? '⚠️ ' : '')
+    + (latest ? `${latest.date} 時点: ` : '') + srcFull(s);
+  document.getElementById('srcBarHint').textContent =
+    SRC_HINTS[srcKey(s)] || '見知らぬデータソースです（確認してください）';
 }
 
 function monthKeys(byMonth){
@@ -348,8 +514,8 @@ async function loadPositions(){
     document.getElementById('posTbl').style.display='';
     data.positions.forEach(p=>{
       const tr=document.createElement('tr');
-      tr.innerHTML = `<td>${p.symbol}</td><td>${p.entry}</td><td>${p.current}</td>
-        <td class="${cls(p.pnl)}">${yen(p.pnl)}<div class="reason">${p.pct>=0?'+':''}${p.pct}%</div></td>`;
+      tr.innerHTML = `<td>${esc(p.symbol)}</td><td>${esc(p.entry)}</td><td>${esc(p.current)}</td>
+        <td class="${cls(p.pnl)}">${yen(p.pnl)}<div class="reason">${p.pct>=0?'+':''}${esc(p.pct)}%</div></td>`;
       tb.appendChild(tr);
     });
   }catch(e){
