@@ -96,6 +96,15 @@
     <div class="empty" id="posEmpty" style="display:none">保有なし（ノーポジション）</div>
   </div>
 
+  <div class="panel"><h2>月ごとの成績 <span class="note">v2稼働日から</span></h2>
+    <table id="monthsTbl"><thead><tr><th>年月</th><th>取引</th><th>勝率</th><th>コストなし</th><th>コスト込み</th></tr></thead>
+    <tbody id="monthsRows"></tbody></table>
+    <div class="empty" id="monthsEmpty" style="display:none">記録がまだありません</div>
+  </div>
+
+  <div class="panel"><h2>月ごとの収支 <span class="note">コストなし / コスト込み</span></h2>
+    <canvas id="monthChart" height="170"></canvas></div>
+
   <div class="panel"><h2>日ごとの結果 <span class="note">取引がない日も表示</span></h2>
     <table id="daysTbl"><thead><tr><th>日付</th><th>状態</th><th>取引</th><th>コストなし</th><th>コスト込み</th></tr></thead>
     <tbody id="daysRows"></tbody></table>
@@ -128,7 +137,7 @@ function costOf(r){ // 半ティック×往復（買い成行＋売り成行）�
   return c;
 }
 
-let dailyChart, cumChart;
+let dailyChart, cumChart, monthChart;
 
 async function load(){
   const res = await fetch('reports/trades.csv?t=' + Date.now());
@@ -142,8 +151,8 @@ async function load(){
 
   if(!rows.length){
     document.getElementById('empty').style.display='block';
-    drawDaily([],[],[]); drawCum([],[],[]);
-    renderDays({});
+    drawDaily([],[],[]); drawCum([],[],[]); drawMonth([],[],[]);
+    renderDays({}); renderMonths([],{});
     return;
   }
   document.getElementById('empty').style.display='none';
@@ -161,6 +170,12 @@ async function load(){
     byDay[r.date].no+=r.pnl; byDay[r.date].cost+=r.pnl-costOf(r); byDay[r.date].n++; });
   const days=Object.keys(byDay).sort();
 
+  const byMonth={};   // 年月キー(YYYY-MM)で集計
+  rows.forEach(r=>{ const m=r.date.slice(0,7); const net=r.pnl-costOf(r);
+    byMonth[m]=byMonth[m]||{no:0,cost:0,n:0,win:0};
+    byMonth[m].no+=r.pnl; byMonth[m].cost+=net; byMonth[m].n++; if(net>0) byMonth[m].win++; });
+  const months=monthKeys(byMonth);
+
   set('tToday',yen(tCost),cls(tCost));
   document.getElementById('tTodayN').textContent = `${tRows.length}取引（${today.slice(5)}）`;
   set('tTotal',yen(total),cls(total));
@@ -174,6 +189,9 @@ async function load(){
   drawDaily(days, days.map(d=>byDay[d].no), days.map(d=>byDay[d].cost));
   drawCum(days, sNo, sCost);
   renderDays(byDay);
+  renderMonths(months, byMonth);
+  drawMonth(months, months.map(m=>byMonth[m]?byMonth[m].no:0),
+                    months.map(m=>byMonth[m]?byMonth[m].cost:0));
 
   const tb=document.getElementById('rows'); tb.innerHTML='';
   const hm = t => t && t.length>15 ? t.slice(11,16) : '—';
@@ -230,6 +248,46 @@ async function renderDays(byDay){
   });
 }
 
+function monthKeys(byMonth){
+  // 取引が1件もない月も0として並べる（グラフの間隔を保つため）
+  const ks=Object.keys(byMonth).sort();
+  if(!ks.length) return [];
+  const last=ks[ks.length-1];
+  const out=[]; let y=+ks[0].slice(0,4), m=+ks[0].slice(5);
+  for(let i=0;i<600;i++){                         // 念のため上限を置く
+    const k=`${y}-${String(m).padStart(2,'0')}`;
+    out.push(k);
+    if(k>=last) break;
+    if(++m>12){ m=1; y++; }
+  }
+  return out;
+}
+const ymLabel = m => `${m.slice(0,4)}年${+m.slice(5)}月`;
+
+function renderMonths(months, byMonth){
+  const tb=document.getElementById('monthsRows'); tb.innerHTML='';
+  if(!months.length){
+    document.getElementById('monthsEmpty').style.display='block';
+    document.getElementById('monthsTbl').style.display='none'; return;
+  }
+  document.getElementById('monthsEmpty').style.display='none';
+  document.getElementById('monthsTbl').style.display='';
+  months.forEach(m=>{
+    const a=byMonth[m];
+    const tr=document.createElement('tr');
+    if(!a){   // その月は取引なし
+      tr.innerHTML = `<td>${ymLabel(m)}</td><td>0</td>
+        <td class="reason">—</td><td class="reason">—</td><td class="reason">—</td>`;
+    } else {
+      tr.innerHTML = `<td>${ymLabel(m)}</td><td>${a.n}</td>
+        <td>${Math.round(a.win/a.n*100)}%</td>
+        <td class="${cls(a.no)}">${yen(a.no)}</td>
+        <td class="${cls(a.cost)}">${yen(a.cost)}</td>`;
+    }
+    tb.appendChild(tr);
+  });
+}
+
 function base(){
   return { color: css('--muted'),
     scalesX: { ticks:{color:css('--muted'),font:{size:11}}, grid:{display:false},
@@ -260,6 +318,18 @@ function drawCum(labels,no,cost){
     options:{responsive:true,interaction:{mode:'index',intersect:false},
       plugins:{legend:b.legend,
         tooltip:{callbacks:{label:c=>` ${c.dataset.label}: ${yen(c.raw)}`}}},
+      scales:{x:b.scalesX,y:b.scalesY}}});
+}
+function drawMonth(labels,no,cost){
+  const b=base(); if(monthChart) monthChart.destroy();
+  monthChart=new Chart(document.getElementById('monthChart'),{type:'bar',
+    data:{labels:labels.map(m=>+m.slice(5)+'月'),datasets:[
+      {label:'コストなし',data:no,backgroundColor:css('--s1'),borderRadius:4,maxBarThickness:44},
+      {label:'コスト込み',data:cost,backgroundColor:css('--s2'),borderRadius:4,maxBarThickness:44}]},
+    options:{responsive:true,
+      plugins:{legend:b.legend,
+        tooltip:{callbacks:{title:c=>ymLabel(labels[c[0].dataIndex]),
+                            label:c=>` ${c.dataset.label}: ${yen(c.raw)}`}}},
       scales:{x:b.scalesX,y:b.scalesY}}});
 }
 async function loadPositions(){
