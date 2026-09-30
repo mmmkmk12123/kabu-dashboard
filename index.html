@@ -242,6 +242,60 @@ function staleDays(latestYmd, now){
   return n >= tol ? n : 0;
 }
 
+// ---- 「本日」タイル ----
+// 「本日」は端末のタイムゾーンに関係なく、東証のある JST の日付・時刻で判定する。
+// 端末が UTC や海外時刻でも、trades.csv / days.json の日付（JST）と同じ土俵で比べられる。
+// 時差を自分で足し引きすると夏時間のある端末で1時間ずれうるので、
+// IANA タイムゾーン(Asia/Tokyo)で年月日と時分を直接取り出し、それを並べ直した Date を返す。
+// 返り値のローカルゲッタ（getFullYear/getDay/getHours…）が JST の壁時計を返すため、
+// ymd() / isTradingDay() / expectedLatestDate() にそのまま渡せる。
+function nowJst(){
+  const n = new Date();
+  try{
+    const p = {};
+    new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Tokyo', hourCycle: 'h23',
+      year:'numeric', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit' })
+      .formatToParts(n).forEach(x => { p[x.type] = x.value; });
+    if(p.year) return new Date(+p.year, +p.month-1, +p.day, +p.hour % 24, +p.minute);
+  }catch(e){}
+  // Intl がタイムゾーンを扱えない古い端末だけの保険（JST固定の足し算）
+  return new Date(n.getTime() + (9*60 + n.getTimezoneOffset()) * 60000);
+}
+// 記録の未来日付を「当日」とみなしてよい上限（日）。
+// 端末のタイムゾーンのズレで生じる日付差は最大1日なので、時計のズレぶん1日を足して2日。
+// これを超える未来日付は記録側の誤りとみなし、救済せず端末の当日を使う
+// （誤った未来日付が1行混ざるだけでタイルがその日に貼り付くのを防ぐ）。
+const TODAY_AHEAD_LIMIT = 2;
+// 当日ぶんだけを「本日」として出す。取引が無ければ 0円（前営業日の数字は絶対に出さない）。
+// trades.csv は16:00の日次サマリーで更新されるため、それ以前に「0取引」と断定しないよう
+// 「16:30ごろ確定」と添える（expectedLatestDate の考え方と揃える）。
+function renderTodayTile(rows){
+  const now = nowJst();
+  const localToday = ymd(now);
+  // 端末の時計が遅れている（または端末が JST より後ろの時間帯）と、記録の方が新しく見える。
+  // その場合だけ記録の最新日を当日とみなす。ただし TODAY_AHEAD_LIMIT 日より先は救済しない。
+  // 記録が古い側（＝前営業日）に引っぱられることは無い。
+  const ahead = ymd(new Date(now.getFullYear(), now.getMonth(),
+                             now.getDate() + TODAY_AHEAD_LIMIT));
+  const latest = rows.reduce((m,r)=> r.date>m ? r.date : m, '');
+  const today = (latest > localToday && latest <= ahead) ? latest : localToday;
+
+  const tRows = rows.filter(r=>r.date===today);
+  const net = tRows.reduce((sm,r)=>sm + (r.pnl - costOf(r)), 0);
+  const el = document.getElementById('tToday');
+  el.textContent = tRows.length ? yen(net) : '0円';
+  el.className = 'val' + (tRows.length ? ' '+cls(net) : '');
+
+  const md = today.slice(5);
+  let sub;
+  if(!isTradingDay(parseYmd(today)))                 sub = `休場（${md}）`;
+  else if(tRows.length)                              sub = `${tRows.length}取引（${md}）`;
+  else if(today===localToday && expectedLatestDate(now)!==today)
+                                                     sub = `0取引（${md}・16:30ごろ確定）`;
+  else                                               sub = `0取引（${md}）`;
+  document.getElementById('tTodayN').textContent = sub;
+}
+
 function costOf(r){ // 半ティック×往復（買い成行＋売り成行）。利確指値のみ売り側0
   const q=+r.qty, e=+r.entry, x=+r.exit;
   let c = tick(e)*0.5*q;
@@ -265,6 +319,7 @@ async function load(){
 
   if(!rows.length){
     document.getElementById('empty').style.display='block';
+    renderTodayTile([]);
     drawDaily([],[],[]); drawCum([],[],[]); drawMonth([],[],[]);
     renderDays({}); renderMonths([],{});
     return;
@@ -272,9 +327,6 @@ async function load(){
   document.getElementById('empty').style.display='none';
 
   const sum = (a,f)=>a.reduce((s,r)=>s+f(r),0);
-  const today = rows[rows.length-1].date;
-  const tRows = rows.filter(r=>r.date===today);
-  const tCost = sum(tRows,r=>r.pnl-costOf(r));
   const total = sum(rows,r=>r.pnl-costOf(r));
   const totalNo = sum(rows,r=>r.pnl);
   const wins = rows.filter(r=>r.pnl-costOf(r)>0).length;
@@ -291,8 +343,7 @@ async function load(){
     byMonth[m].no+=r.pnl; byMonth[m].cost+=net; byMonth[m].n++; if(net>0) byMonth[m].win++; });
   const months=monthKeys(byMonth);
 
-  set('tToday',yen(tCost),cls(tCost));
-  document.getElementById('tTodayN').textContent = `${tRows.length}取引（${today.slice(5)}）`;
+  renderTodayTile(rows);
   set('tTotal',yen(total),cls(total));
   document.getElementById('tTotalNo').textContent = `コストなし ${yen(totalNo)}`;
   document.getElementById('tWr').textContent = `${Math.round(wins/rows.length*100)}%`;
@@ -396,7 +447,7 @@ function renderSrcBar(days, byDay){
   const latest = days.find(d=>d.status!=='holiday');
   const s = latest ? daySrc(latest, byDay[latest.date]) : 'unknown';
   const lv = latest ? srcLevel(s) : 'info';
-  const behind = latest ? staleDays(latest.date, new Date()) : 0;
+  const behind = latest ? staleDays(latest.date, nowJst()) : 0;
   const warn = behind > 0 || lv === 'warn';
   bar.className = 'srcbar' + (warn ? ' warn' : '');
   valEl.className = 'val' + (!warn && lv === 'ok' ? ' ok' : '');
